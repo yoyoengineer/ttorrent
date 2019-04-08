@@ -15,20 +15,28 @@
  */
 package com.turn.ttorrent.cli;
 
+import com.turn.ttorrent.cli.client.ClientPath;
+import com.turn.ttorrent.cli.client.ClientServiceContainer;
+import com.turn.ttorrent.cli.client.HTTPMethod;
+import com.turn.ttorrent.cli.client.ParamKeys;
 import com.turn.ttorrent.client.CommunicationManager;
-import com.turn.ttorrent.client.SimpleClient;
 import jargs.gnu.CmdLineParser;
 import org.apache.log4j.BasicConfigurator;
 import org.apache.log4j.ConsoleAppender;
 import org.apache.log4j.PatternLayout;
+import org.simpleframework.http.core.ContainerServer;
+import org.simpleframework.transport.connect.Connection;
+import org.simpleframework.transport.connect.SocketConnection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
+import java.io.IOException;
 import java.io.PrintStream;
 import java.net.*;
 import java.nio.channels.UnsupportedAddressTypeException;
+import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.List;
 
 /**
  * Command-line entry-point for starting a {@link CommunicationManager}
@@ -37,6 +45,10 @@ public class ClientMain {
 
   private static final Logger logger =
           LoggerFactory.getLogger(ClientMain.class);
+  private static SocketAddress myBoundAddress = null;
+  private static Connection connection;
+  private static final ClientServiceContainer clientServiceContainer = new ClientServiceContainer();
+  private static int DEFAULT_CLIENT_PORT = 9696;
 
   /**
    * Default data output directory.
@@ -61,7 +73,7 @@ public class ClientMain {
    * @param iface The network interface name.
    * @return A usable IPv4 address as a {@link Inet4Address}.
    * @throws UnsupportedAddressTypeException If no IPv4 address was available
-   * to bind on.
+   *                                         to bind on.
    */
   private static Inet4Address getIPv4Address(String iface)
           throws SocketException, UnsupportedAddressTypeException,
@@ -85,36 +97,63 @@ public class ClientMain {
     throw new UnsupportedAddressTypeException();
   }
 
+  public static Inet4Address getInet4Address(String domainName)
+          throws UnsupportedAddressTypeException,
+          UnknownHostException {
+    if (domainName != null) {
+      InetAddress address = InetAddress.getByName(domainName);
+      if (address instanceof Inet4Address) {
+        return (Inet4Address) address;
+      }
+    }
+
+    InetAddress localhost = InetAddress.getLocalHost();
+    if (localhost instanceof Inet4Address) {
+      return (Inet4Address) localhost;
+    }
+
+    throw new UnsupportedAddressTypeException();
+  }
+
   /**
    * Display program usage on the given {@link PrintStream}.
    */
   private static void usage(PrintStream s) {
-    s.println("usage: Client [options] <torrent>");
+    s.println("usage: Client [options]");
     s.println();
     s.println("Available options:");
-    s.println("  -h,--help                  Show this help and exit.");
-    s.println("  -o,--output DIR            Read/write data to directory DIR.");
-    s.println("  -i,--iface IFACE           Bind to interface IFACE.");
-    s.println("  -s,--seed SECONDS          Time to seed after downloading (default: infinitely).");
-    s.println("  -d,--max-download KB/SEC   Max download rate (default: unlimited).");
-    s.println("  -u,--max-upload KB/SEC     Max upload rate (default: unlimited).");
+    s.println("  -h,--help             Show this help and exit.");
+    s.println("  -p,--port PORT        Bind to port PORT.");
     s.println();
+    s.println("API:");
+    s.println("start seeding");
+    s.println("request address:\t" + ClientPath.BASE_URL + ClientPath.START);
+    s.println("HTTP Method:\t" + HTTPMethod.POST);
+    s.println("request parameters:");
+    s.println("name\trequired\tdescription");
+    s.println(ParamKeys.TORRENT_PATH + "\t" + true + "\t" + "The path that stored the torrents");
+    s.println(ParamKeys.METAINFO_PATH + "\t" + true + "\t" + "The path that stored the metainfo files");
+    s.println(ParamKeys.SEED + "\t" + false + "\t" + "The duration of the seeding.");
+    s.println(ParamKeys.DOMAIN_NAME + "\t" + false + "\t" + "The domain name that corresponding to the ip of the host, which are going to start seeding.");
+    s.println();
+    s.println("stop seeding");
+    s.println("request address:\t" + ClientPath.BASE_URL + ClientPath.STOP);
+    s.println("HTTP Method:\t" + HTTPMethod.POST);
+    s.println("request parameters:");
+    s.println("name\trequired\tdescription");
+    s.println(ParamKeys.HEX_INFO_HASH + "\t" + true + "\t" + "the hex infohash of the metainfo file");
   }
 
   /**
    * Main client entry point for stand-alone operation.
    */
-  public static void main(String[] args) {
+  public static void main(String[] args) throws IOException {
     BasicConfigurator.configure(new ConsoleAppender(
             new PatternLayout("%d [%-25t] %-5p: %m%n")));
 
     CmdLineParser parser = new CmdLineParser();
     CmdLineParser.Option help = parser.addBooleanOption('h', "help");
-    CmdLineParser.Option output = parser.addStringOption('o', "output");
-    CmdLineParser.Option iface = parser.addStringOption('i', "iface");
-    CmdLineParser.Option seedTime = parser.addIntegerOption('s', "seed");
-    CmdLineParser.Option maxUpload = parser.addDoubleOption('u', "max-upload");
-    CmdLineParser.Option maxDownload = parser.addDoubleOption('d', "max-download");
+    CmdLineParser.Option port = parser.addIntegerOption('p', "port");
 
     try {
       parser.parse(args);
@@ -130,36 +169,48 @@ public class ClientMain {
       System.exit(0);
     }
 
-    String outputValue = (String) parser.getOptionValue(output,
-            DEFAULT_OUTPUT_DIRECTORY);
-    String ifaceValue = (String) parser.getOptionValue(iface);
-    int seedTimeValue = (Integer) parser.getOptionValue(seedTime, -1);
+    final Integer portValue = (Integer) parser.getOptionValue(port,
+            DEFAULT_CLIENT_PORT);
 
-    String[] otherArgs = parser.getRemainingArgs();
-    if (otherArgs.length != 1) {
-      usage(System.err);
-      System.exit(1);
-    }
 
-    SimpleClient client = new SimpleClient();
-    try {
-      Inet4Address iPv4Address = getIPv4Address(ifaceValue);
-      File torrentFile = new File(otherArgs[0]);
-      File outputFile = new File(outputValue);
+    connection = new SocketConnection(new ContainerServer(clientServiceContainer));
 
-      client.downloadTorrent(
-              torrentFile.getAbsolutePath(),
-              outputFile.getAbsolutePath(),
-              iPv4Address);
-      if (seedTimeValue > 0) {
-        Thread.sleep(seedTimeValue * 1000);
+    List<SocketAddress> tries = new ArrayList<SocketAddress>() {{
+      try {
+        add(new InetSocketAddress(InetAddress.getByAddress(new byte[4]), portValue));
+      } catch (Exception ex) {
       }
+      try {
+        add(new InetSocketAddress(InetAddress.getLocalHost(), portValue));
+      } catch (Exception ex) {
+      }
+    }};
 
-    } catch (Exception e) {
-      logger.error("Fatal error: {}", e.getMessage(), e);
-      System.exit(2);
-    } finally {
-      client.stop();
+    boolean started = false;
+    for (SocketAddress address : tries) {
+      try {
+        if ((myBoundAddress = connection.connect(address)) != null) {
+          logger.info("Started client on {}", address);
+          started = true;
+          break;
+        }
+      } catch (IOException ioe) {
+        logger.info("Can't start the client using address{} : ", address.toString(), ioe.getMessage());
+      }
+    }
+    if (!started) {
+      logger.error("Cannot start client on port {}. Stopping now...", portValue);
+      stop();
+      return;
+    }
+  }
+
+  public static void stop() {
+    try {
+      connection.close();
+      logger.info("BitTorrent client closed.");
+    } catch (IOException ioe) {
+      logger.error("Could not stop the client: {}!", ioe.getMessage());
     }
   }
 }
